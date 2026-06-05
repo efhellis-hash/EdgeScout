@@ -6,12 +6,17 @@ bullpen, forma reciente, matchups) + API de clima (viento/temp en MLB/NFL).
 Devuelve una estimacion de probabilidad PROPIA con su razonamiento, partiendo
 del numero del mercado como ancla.
 """
+import os
 import json
 import time
 import requests
 import anthropic
 from anthropic import RateLimitError
 from config import ANTHROPIC_API_KEY, MODEL, OPENWEATHER_API_KEY, OUTDOOR_SPORTS
+
+# Modelo de investigacion: Haiku por defecto (mas rapido y mas barato que Sonnet,
+# suficiente para buscar y resumir pitcher/lesiones/clima). Cambiable por env.
+RESEARCH_MODEL = os.environ.get("RESEARCH_MODEL", "claude-haiku-4-5-20251001")
 
 # max_retries deja que el SDK reintente solo ante throttling temporal
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=4)
@@ -62,7 +67,7 @@ TOOLS = [
             "required": ["city"],
         },
     },
-    {"type": "web_search_20250305", "name": "web_search", "max_uses": 4},
+    {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
 ]
 CLIENT_TOOLS = {"get_weather": get_weather}
 
@@ -106,7 +111,7 @@ def research_team_prob(matchup: str, sport: str, team: str,
     messages = [{"role": "user", "content": user}]
     for _ in range(8):
         resp = _create_with_backoff(
-            model=MODEL, max_tokens=1500, system=SYSTEM,
+            model=RESEARCH_MODEL, max_tokens=1500, system=SYSTEM,
             tools=TOOLS, messages=messages,
         )
         tool_results = []
