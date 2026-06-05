@@ -7,6 +7,7 @@ Devuelve una estimacion de probabilidad PROPIA con su razonamiento, partiendo
 del numero del mercado como ancla.
 """
 import os
+import re
 import json
 import time
 import requests
@@ -127,8 +128,32 @@ def research_team_prob(matchup: str, sport: str, team: str,
                 messages.append({"role": "user", "content": tool_results})
             continue
         text = "".join(b.text for b in resp.content if b.type == "text").strip()
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return {"raw": text, "parse_error": True}
+        parsed = _parse_json_robusto(text)
+        return parsed if parsed is not None else {"raw": text, "parse_error": True}
     return {"error": "max turnos"}
+
+
+def _parse_json_robusto(text: str):
+    """Extrae JSON aunque venga con ```json fences o texto alrededor (Haiku
+    a veces no devuelve JSON puro)."""
+    if not text:
+        return None
+    t = text.strip()
+    # quitar fences de markdown
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t[:4].lower() == "json":
+            t = t[4:]
+        t = t.strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        pass
+    # extraer el primer objeto {...} que aparezca
+    m = re.search(r"\{.*\}", t, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    return None
