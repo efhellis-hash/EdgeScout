@@ -42,22 +42,24 @@ def analizar_juego(game: dict, sport: str, bankroll: float,
 
         model_prob = research.get("model_prob", info["fair_prob"])
         veredicto = evaluate(model_prob, info["fair_prob"], info["decimal"])
+        es_pick = veredicto["veredicto"] == "PASO"
+        stake = (stake_usd(bankroll, model_prob, info["decimal"])
+                 if es_pick else {"stake_pct": 0.0, "stake_usd": 0.0})
 
-        if veredicto["veredicto"] != "PASO":
-            continue  # solo recomendamos lo que pasa todos los filtros
-
-        stake = stake_usd(bankroll, model_prob, info["decimal"])
-        pick_id = clv.log_pick(
+        # Guardamos SIEMPRE el analisis (para poder desplegar cada juego)
+        clv.log_analysis(
             sport, matchup, team, info["decimal"], model_prob,
-            veredicto["ev"], stake["stake_pct"],
+            info["fair_prob"], veredicto["ev"], stake["stake_pct"], es_pick,
             factors=research.get("key_factors"),
             weather=research.get("weather_impact"),
             reason=research.get("adjustment_reason"),
             data_quality=research.get("data_quality"),
         )
 
+        if not es_pick:
+            continue  # se guardo el analisis, pero no es recomendacion
+
         recomendaciones.append({
-            "pick_id": pick_id,
             "pick": f"{team} ML @ {info['american']:+d} ({info['book']})",
             "prob_modelo": f"{model_prob:.1%}",
             "prob_mercado_justa": f"{info['fair_prob']:.1%}",
