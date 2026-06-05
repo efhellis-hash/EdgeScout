@@ -24,28 +24,37 @@ def init_db():
             factors TEXT,           -- pitcher, lesiones, forma (JSON)
             weather TEXT,           -- impacto del clima
             reason TEXT,            -- por que se ajusto la prob
-            data_quality TEXT       -- alta/media/baja
+            data_quality TEXT,      -- alta/media/baja
+            market_fair REAL,       -- prob justa del mercado (sin vig)
+            is_pick INTEGER         -- 1 si paso el filtro de valor, 0 si no
         )
     """)
     # Migracion para bases ya creadas sin las columnas nuevas
-    for col in ("factors", "weather", "reason", "data_quality"):
+    migraciones = {"factors": "TEXT", "weather": "TEXT", "reason": "TEXT",
+                   "data_quality": "TEXT", "market_fair": "REAL",
+                   "is_pick": "INTEGER"}
+    for col, tipo in migraciones.items():
         try:
-            con.execute(f"ALTER TABLE picks ADD COLUMN {col} TEXT")
+            con.execute(f"ALTER TABLE picks ADD COLUMN {col} {tipo}")
         except sqlite3.OperationalError:
             pass  # ya existe
     con.commit()
     con.close()
 
 
-def log_pick(sport, matchup, team, decimal_at_pick, model_prob, ev, stake_pct,
-             factors=None, weather=None, reason=None, data_quality=None):
+def log_analysis(sport, matchup, team, decimal_at_pick, model_prob, market_fair,
+                 ev, stake_pct, is_pick, factors=None, weather=None,
+                 reason=None, data_quality=None):
+    """Guarda el analisis de UN equipo (haya pasado o no el filtro).
+    is_pick=1 marca los que son recomendaciones reales."""
     con = sqlite3.connect(DB_PATH)
     cur = con.execute(
         "INSERT INTO picks (ts, sport, matchup, team, decimal_at_pick, "
-        "model_prob, ev, stake_pct, factors, weather, reason, data_quality) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "model_prob, market_fair, ev, stake_pct, is_pick, factors, weather, "
+        "reason, data_quality) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (dt.datetime.utcnow().isoformat(), sport, matchup, team,
-         decimal_at_pick, model_prob, ev, stake_pct,
+         decimal_at_pick, model_prob, market_fair, ev, stake_pct,
+         1 if is_pick else 0,
          json.dumps(factors, ensure_ascii=False) if factors else None,
          weather, reason, data_quality),
     )
@@ -53,6 +62,36 @@ def log_pick(sport, matchup, team, decimal_at_pick, model_prob, ev, stake_pct,
     pick_id = cur.lastrowid
     con.close()
     return pick_id
+
+
+def analisis_recientes():
+    """Devuelve el analisis mas reciente por (matchup, equipo) como lista de dicts."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        rows = con.execute(
+            "SELECT ts, matchup, team, decimal_at_pick, model_prob, market_fair, "
+            "ev, stake_pct, is_pick, clv_pct, result, factors, weather, reason, "
+            "data_quality FROM picks WHERE id IN "
+            "(SELECT MAX(id) FROM picks GROUP BY matchup, team)"
+        ).fetchall()
+    except Exception:
+        con.close()
+        return []
+    con.close()
+    out = []
+    for r in rows:
+        try:
+            factores = json.loads(r[11]) if r[11] else []
+        except Exception:
+            factores = []
+        out.append({
+            "matchup": r[1], "team": r[2], "decimal": r[3],
+            "model_prob": r[4], "market_fair": r[5], "ev": r[6],
+            "stake_pct": r[7], "is_pick": bool(r[8]), "clv_pct": r[9],
+            "result": r[10], "factores": factores, "weather": r[12],
+            "reason": r[13], "data_quality": r[14],
+        })
+    return out
 
 
 def cerrar_pick(pick_id: int, closing_decimal: float, result: str = None):
