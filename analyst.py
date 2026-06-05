@@ -14,7 +14,10 @@ from odds import fetch_odds, best_moneyline
 from research import research_team_prob
 from value import evaluate
 from bankroll import stake_usd, puede_operar
+import time
 import clv
+
+THROTTLE_SEGUNDOS = 8  # pausa entre juegos para no saturar el limite de tokens/min
 
 
 def analizar_juego(game: dict, sport: str, bankroll: float,
@@ -74,6 +77,7 @@ def correr_dia(sport: str, bankroll: float, perdida_hoy: float = 0.0):
     salida = []
     for g in juegos:
         salida.append(analizar_juego(g, sport, bankroll, perdida_hoy))
+        time.sleep(THROTTLE_SEGUNDOS)
     return salida
 
 
