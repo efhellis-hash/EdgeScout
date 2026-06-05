@@ -5,6 +5,7 @@ No mide aciertos (eso engana). Mide si conseguiste mejor precio que la linea de
 cierre. Si tu CLV es positivo de forma sostenida sobre una muestra grande,
 tienes algo real. Si no, tu win rate es ilusion. Esto es lo PRIMERO que mides.
 """
+import os
 import json
 import sqlite3
 import datetime as dt
@@ -12,6 +13,10 @@ from config import DB_PATH
 
 
 def init_db():
+    # Asegura que exista la carpeta de la base (ej. /data del volumen)
+    carpeta = os.path.dirname(DB_PATH)
+    if carpeta:
+        os.makedirs(carpeta, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("""
         CREATE TABLE IF NOT EXISTS picks (
