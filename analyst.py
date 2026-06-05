@@ -14,6 +14,7 @@ from odds import fetch_odds, best_moneyline
 from research import research_team_prob
 from value import evaluate
 from bankroll import stake_usd, puede_operar
+import os
 import time
 import clv
 
@@ -90,10 +91,16 @@ def analizar_juego(game: dict, sport: str, bankroll: float,
 def correr_dia(sport: str, bankroll: float, perdida_hoy: float = 0.0):
     clv.init_db()
     juegos = fetch_odds(sport)
+    # Tope de juegos por corrida: corta tiempo y gasto. 0 = todos.
+    max_juegos = int(os.environ.get("MAX_JUEGOS", "6"))
+    if max_juegos:
+        juegos = juegos[:max_juegos]
     salida = []
-    for g in juegos:
+    for i, g in enumerate(juegos, 1):
+        print(f"[EdgeScout] analizando juego {i}/{len(juegos)}")
         salida.append(analizar_juego(g, sport, bankroll, perdida_hoy))
         time.sleep(THROTTLE_SEGUNDOS)
+    print("[EdgeScout] corrida completa")
     return salida
 
 
