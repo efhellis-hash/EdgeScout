@@ -5,6 +5,7 @@ No mide aciertos (eso engana). Mide si conseguiste mejor precio que la linea de
 cierre. Si tu CLV es positivo de forma sostenida sobre una muestra grande,
 tienes algo real. Si no, tu win rate es ilusion. Esto es lo PRIMERO que mides.
 """
+import json
 import sqlite3
 import datetime as dt
 from config import DB_PATH
@@ -19,20 +20,34 @@ def init_db():
             decimal_at_pick REAL, model_prob REAL, ev REAL, stake_pct REAL,
             closing_decimal REAL,   -- se llena tras el cierre
             clv_pct REAL,           -- se calcula al cerrar
-            result TEXT             -- W / L / Push tras el juego
+            result TEXT,            -- W / L / Push tras el juego
+            factors TEXT,           -- pitcher, lesiones, forma (JSON)
+            weather TEXT,           -- impacto del clima
+            reason TEXT,            -- por que se ajusto la prob
+            data_quality TEXT       -- alta/media/baja
         )
     """)
+    # Migracion para bases ya creadas sin las columnas nuevas
+    for col in ("factors", "weather", "reason", "data_quality"):
+        try:
+            con.execute(f"ALTER TABLE picks ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass  # ya existe
     con.commit()
     con.close()
 
 
-def log_pick(sport, matchup, team, decimal_at_pick, model_prob, ev, stake_pct):
+def log_pick(sport, matchup, team, decimal_at_pick, model_prob, ev, stake_pct,
+             factors=None, weather=None, reason=None, data_quality=None):
     con = sqlite3.connect(DB_PATH)
     cur = con.execute(
         "INSERT INTO picks (ts, sport, matchup, team, decimal_at_pick, "
-        "model_prob, ev, stake_pct) VALUES (?,?,?,?,?,?,?,?)",
+        "model_prob, ev, stake_pct, factors, weather, reason, data_quality) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (dt.datetime.utcnow().isoformat(), sport, matchup, team,
-         decimal_at_pick, model_prob, ev, stake_pct),
+         decimal_at_pick, model_prob, ev, stake_pct,
+         json.dumps(factors, ensure_ascii=False) if factors else None,
+         weather, reason, data_quality),
     )
     con.commit()
     pick_id = cur.lastrowid
