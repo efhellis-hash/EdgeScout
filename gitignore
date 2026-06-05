@@ -1,0 +1,11 @@
+# Secretos — NUNCA subir
+.env
+
+# Base de datos local (CLV) — ver nota sobre persistencia en Railway
+*.db
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
