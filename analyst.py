@@ -47,8 +47,14 @@ def analizar_juego(game: dict, sport: str, bankroll: float,
             continue  # solo recomendamos lo que pasa todos los filtros
 
         stake = stake_usd(bankroll, model_prob, info["decimal"])
-        pick_id = clv.log_pick(sport, matchup, team, info["decimal"],
-                               model_prob, veredicto["ev"], stake["stake_pct"])
+        pick_id = clv.log_pick(
+            sport, matchup, team, info["decimal"], model_prob,
+            veredicto["ev"], stake["stake_pct"],
+            factors=research.get("key_factors"),
+            weather=research.get("weather_impact"),
+            reason=research.get("adjustment_reason"),
+            data_quality=research.get("data_quality"),
+        )
 
         recomendaciones.append({
             "pick_id": pick_id,
