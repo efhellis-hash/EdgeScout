@@ -279,15 +279,17 @@ PAGINA = """
         {% if not j.analisis %}
           <div class="empty">Sin análisis aún. Corre "Analizar ahora".</div>
         {% else %}
+          {% set a0 = j.analisis[0] %}
+          {% if a0.reason %}<div class="meta">{{ a0.reason }}</div>{% endif %}
+          {% for f in a0.factores %}<div class="factor">{{ f }}</div>{% endfor %}
+          {% if a0.weather and a0.weather != 'N/A' %}<div class="meta">Clima: {{ a0.weather }}</div>{% endif %}
+          <div class="meta">Calidad de datos: {{ a0.data_quality or 'n/d' }}</div>
           {% for a in j.analisis %}
           <div class="team-an {{ 'pickrow' if a.is_pick else '' }}">
-            <div class="pick-team">{{ a.team }}
-              {% if a.is_pick %}<span class="fav">pick · EV {{ (a.ev*100)|round(1) }}%</span>{% endif %}</div>
-            <div class="meta">modelo {{ (a.model_prob*100)|round(0)|int }}% vs
-              mercado {{ (a.market_fair*100)|round(0)|int }}% · datos {{ a.data_quality or 'n/d' }}</div>
-            {% if a.reason %}<div class="meta">{{ a.reason }}</div>{% endif %}
-            {% for f in a.factores %}<div class="factor">{{ f }}</div>{% endfor %}
-            {% if a.weather and a.weather != 'N/A' %}<div class="meta">Clima: {{ a.weather }}</div>{% endif %}
+            <span class="pick-team">{{ a.team }}</span> —
+            modelo {{ (a.model_prob*100)|round(0)|int }}% vs mercado {{ (a.market_fair*100)|round(0)|int }}%
+            · EV <span class="{{ 'pos' if a.ev>0 else 'neg' }}">{{ (a.ev*100)|round(1) }}%</span>
+            {% if a.is_pick %}<span class="fav">PICK</span>{% endif %}
           </div>
           {% endfor %}
         {% endif %}
