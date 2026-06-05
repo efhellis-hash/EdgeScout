@@ -137,6 +137,8 @@ def _run_analysis():
     _running["flag"] = True
     try:
         correr_dia(SPORT, BANKROLL)
+    except Exception as e:
+        print(f"[EdgeScout] ERROR en analisis: {type(e).__name__}: {e}")
     finally:
         _running["flag"] = False
 
