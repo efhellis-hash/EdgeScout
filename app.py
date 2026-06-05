@@ -113,6 +113,8 @@ def armar_dashboard():
         for j in juegos:
             j["analisis"] = by_match.get(j["matchup"], [])
             matchups_hoy.add(j["matchup"])
+        # Los juegos analizados (con datos) primero
+        juegos.sort(key=lambda j: len(j.get("analisis", [])), reverse=True)
 
     picks = [a for a in analisis if a["is_pick"]
              and (matchups_hoy is None or a["matchup"] in matchups_hoy)]
