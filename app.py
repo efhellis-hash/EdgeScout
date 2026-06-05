@@ -264,7 +264,7 @@ PAGINA = """
     <div class="empty">Sin juegos cargados aun.</div>
   {% else %}
     {% for j in juegos %}
-    <details class="game">
+    <details class="game"{% if j.analisis %} open{% endif %}>
       <summary>
         <div class="matchup">{{ j.matchup }} <span class="hora">· {{ j.hora }}</span></div>
         {% for e in j.equipos %}
