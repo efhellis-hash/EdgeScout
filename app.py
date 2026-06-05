@@ -10,6 +10,7 @@ Start command en Railway: python app.py
 Reemplaza a scheduler.py (este ya incluye el scheduler).
 """
 import os
+import json
 import time
 import threading
 import sqlite3
@@ -62,12 +63,18 @@ def juegos_con_odds():
         if not ml:
             continue
         equipos = [k for k in ml if k not in ("matchup", "commence_time")]
+        lista = [{"team": t, "american": ml[t]["american"],
+                  "fair": ml[t]["fair_prob"], "book": ml[t]["book"]}
+                 for t in equipos]
+        # El favorito es el de mayor probabilidad justa
+        if lista:
+            fav = max(lista, key=lambda e: e["fair"])
+            for e in lista:
+                e["favorito"] = (e is fav)
         filas.append({
             "matchup": ml["matchup"],
             "hora": _fmt_hora(ml.get("commence_time")),
-            "equipos": [{"team": t, "american": ml[t]["american"],
-                         "fair": ml[t]["fair_prob"], "book": ml[t]["book"]}
-                        for t in equipos],
+            "equipos": lista,
         })
     _cache["data"] = filas
     _cache["ts"] = now
@@ -79,12 +86,31 @@ def picks_registrados(limit=50):
         con = sqlite3.connect(DB_PATH)
         rows = con.execute(
             "SELECT ts, matchup, team, decimal_at_pick, model_prob, ev, "
-            "stake_pct, clv_pct, result FROM picks ORDER BY id DESC LIMIT ?",
-            (limit,)).fetchall()
+            "stake_pct, clv_pct, result, factors, weather, reason, data_quality "
+            "FROM picks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         con.close()
-        return rows
     except Exception:
         return []
+    out = []
+    for r in rows:
+        try:
+            factores = json.loads(r[9]) if r[9] else []
+        except Exception:
+            factores = []
+        out.append({
+            "fecha": (r[0] or "")[5:10],
+            "team": r[2],
+            "model_prob": r[4],
+            "ev": r[5],
+            "stake_pct": r[6],
+            "clv_pct": r[7],
+            "result": r[8],
+            "factores": factores,
+            "weather": r[10],
+            "reason": r[11],
+            "data_quality": r[12],
+        })
+    return out
 
 
 # ----------------------------- Corrida bajo demanda ------------------------
@@ -125,6 +151,19 @@ PAGINA = """
          font-size:.9rem; }
   .odds { color:#58a6ff; font-variant-numeric:tabular-nums; }
   .fair { color:#7d8590; font-size:.8rem; }
+  .fav { background:#1f6feb33; color:#79c0ff; font-size:.65rem; font-weight:600;
+         padding:1px 6px; border-radius:6px; margin-left:6px;
+         text-transform:uppercase; letter-spacing:.04em; }
+  .pick-card { background:#161b22; border:1px solid #30363d; border-left:3px solid #3fb950;
+               border-radius:10px; padding:12px 14px; margin-bottom:8px; }
+  .pick-head { display:flex; justify-content:space-between; align-items:baseline;
+               margin-bottom:6px; }
+  .pick-team { font-weight:600; }
+  .pill { font-size:.72rem; color:#7d8590; }
+  .factor { font-size:.82rem; color:#c9d1d9; padding:3px 0 3px 14px;
+            position:relative; }
+  .factor:before { content:"▸"; position:absolute; left:0; color:#3fb950; }
+  .meta { font-size:.78rem; color:#7d8590; margin-top:6px; }
   .btn { display:inline-block; background:#238636; color:#fff; padding:8px 14px;
          border-radius:8px; text-decoration:none; font-size:.9rem; }
   .clv { background:#161b22; border:1px solid #30363d; border-radius:10px;
@@ -152,7 +191,8 @@ PAGINA = """
       <div class="matchup">{{ j.matchup }} <span class="hora">· {{ j.hora }}</span></div>
       {% for e in j.equipos %}
       <div class="row">
-        <span>{{ e.team }} <span class="fair">justa {{ (e.fair*100)|round(1) }}%</span></span>
+        <span>{{ e.team }}{% if e.favorito %}<span class="fav">favorito</span>{% endif %}
+          <span class="fair">justa {{ (e.fair*100)|round(1) }}%</span></span>
         <span class="odds">{{ '%+d' % e.american }} <span class="fair">{{ e.book }}</span></span>
       </div>
       {% endfor %}
@@ -164,19 +204,24 @@ PAGINA = """
   {% if not picks %}
     <div class="empty">Aun sin recomendaciones. Corre "Analizar ahora".</div>
   {% else %}
-  <div class="card"><table>
-    <tr><th>Fecha</th><th>Pick</th><th>Modelo</th><th>EV</th><th>CLV</th><th>Res</th></tr>
     {% for p in picks %}
-    <tr>
-      <td>{{ p[0][5:10] }}</td>
-      <td>{{ p[2] }}</td>
-      <td>{{ (p[4]*100)|round(0)|int }}%</td>
-      <td>{{ (p[5]*100)|round(1) }}%</td>
-      <td>{% if p[7] is not none %}<span class="{{ 'pos' if p[7]>0 else 'neg' }}">{{ p[7] }}%</span>{% else %}—{% endif %}</td>
-      <td>{{ p[8] or '—' }}</td>
-    </tr>
+    <div class="pick-card">
+      <div class="pick-head">
+        <span class="pick-team">{{ p.team }}</span>
+        <span class="pill">{{ p.fecha }} · modelo {{ (p.model_prob*100)|round(0)|int }}%
+          · EV {{ (p.ev*100)|round(1) }}% · stake {{ (p.stake_pct*100)|round(2) }}%</span>
+      </div>
+      {% if p.reason %}<div class="meta">Razon: {{ p.reason }}</div>{% endif %}
+      {% for f in p.factores %}<div class="factor">{{ f }}</div>{% endfor %}
+      <div class="meta">
+        {% if p.weather and p.weather != 'N/A' %}Clima: {{ p.weather }} · {% endif %}
+        datos: {{ p.data_quality or 'n/d' }}
+        {% if p.clv_pct is not none %} · CLV
+          <span class="{{ 'pos' if p.clv_pct>0 else 'neg' }}">{{ p.clv_pct }}%</span>{% endif %}
+        {% if p.result %} · {{ p.result }}{% endif %}
+      </div>
+    </div>
     {% endfor %}
-  </table></div>
   {% endif %}
 
   <h2>CLV acumulado</h2>
