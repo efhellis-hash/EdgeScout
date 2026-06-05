@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python scheduler.py"
+startCommand = "python app.py"
