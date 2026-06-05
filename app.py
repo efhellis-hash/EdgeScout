@@ -311,6 +311,22 @@ PAGINA = """
 """
 
 
+@app.route("/debug")
+def debug():
+    try:
+        con = sqlite3.connect(DB_PATH)
+        total = con.execute("SELECT COUNT(*) FROM picks").fetchone()[0]
+        picks = con.execute("SELECT COUNT(*) FROM picks WHERE is_pick=1").fetchone()[0]
+        ult = con.execute(
+            "SELECT ts, matchup, team, model_prob, ev, is_pick "
+            "FROM picks ORDER BY id DESC LIMIT 6").fetchall()
+        con.close()
+        return {"db_path": DB_PATH, "total_analisis": total,
+                "total_picks": picks, "ultimos": ult}
+    except Exception as e:
+        return {"db_path": DB_PATH, "error": f"{type(e).__name__}: {e}"}
+
+
 @app.route("/")
 def home():
     juegos, pick_dia, dupleta, tripleta = armar_dashboard()
