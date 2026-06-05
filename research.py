@@ -7,11 +7,27 @@ Devuelve una estimacion de probabilidad PROPIA con su razonamiento, partiendo
 del numero del mercado como ancla.
 """
 import json
+import time
 import requests
 import anthropic
+from anthropic import RateLimitError
 from config import ANTHROPIC_API_KEY, MODEL, OPENWEATHER_API_KEY, OUTDOOR_SPORTS
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# max_retries deja que el SDK reintente solo ante throttling temporal
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=4)
+
+
+def _create_with_backoff(**kwargs):
+    """Llama al modelo y, si pega el limite de tokens/minuto, espera y reintenta
+    en vez de tumbar todo el job. Espera creciente: 10, 20, 40, 60s."""
+    for intento in range(5):
+        try:
+            return client.messages.create(**kwargs)
+        except RateLimitError:
+            espera = min(60, 10 * (2 ** intento))
+            print(f"[EdgeScout] limite de tokens/min, espero {espera}s...")
+            time.sleep(espera)
+    raise RuntimeError("Rate limit persistente tras varios reintentos")
 
 
 def get_weather(city: str, country_code: str = "US") -> dict:
@@ -46,7 +62,7 @@ TOOLS = [
             "required": ["city"],
         },
     },
-    {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+    {"type": "web_search_20250305", "name": "web_search", "max_uses": 4},
 ]
 CLIENT_TOOLS = {"get_weather": get_weather}
 
@@ -89,8 +105,8 @@ def research_team_prob(matchup: str, sport: str, team: str,
 
     messages = [{"role": "user", "content": user}]
     for _ in range(8):
-        resp = client.messages.create(
-            model=MODEL, max_tokens=2000, system=SYSTEM,
+        resp = _create_with_backoff(
+            model=MODEL, max_tokens=1500, system=SYSTEM,
             tools=TOOLS, messages=messages,
         )
         tool_results = []
