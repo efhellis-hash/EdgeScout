@@ -66,7 +66,6 @@ def juegos_con_odds():
         lista = [{"team": t, "american": ml[t]["american"],
                   "fair": ml[t]["fair_prob"], "book": ml[t]["book"]}
                  for t in equipos]
-        # El favorito es el de mayor probabilidad justa
         if lista:
             fav = max(lista, key=lambda e: e["fair"])
             for e in lista:
@@ -81,36 +80,56 @@ def juegos_con_odds():
     return filas
 
 
-def picks_registrados(limit=50):
-    try:
-        con = sqlite3.connect(DB_PATH)
-        rows = con.execute(
-            "SELECT ts, matchup, team, decimal_at_pick, model_prob, ev, "
-            "stake_pct, clv_pct, result, factors, weather, reason, data_quality "
-            "FROM picks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        con.close()
-    except Exception:
-        return []
-    out = []
-    for r in rows:
-        try:
-            factores = json.loads(r[9]) if r[9] else []
-        except Exception:
-            factores = []
-        out.append({
-            "fecha": (r[0] or "")[5:10],
-            "team": r[2],
-            "model_prob": r[4],
-            "ev": r[5],
-            "stake_pct": r[6],
-            "clv_pct": r[7],
-            "result": r[8],
-            "factores": factores,
-            "weather": r[10],
-            "reason": r[11],
-            "data_quality": r[12],
-        })
-    return out
+def _dec_to_american(d):
+    if d >= 2:
+        return round((d - 1) * 100)
+    return round(-100 / (d - 1))
+
+
+def _parlay(legs):
+    """Combina patas independientes. EV = prod(p)*prod(d) - 1.
+    El edge se compone, pero la varianza explota y el error de modelo se multiplica."""
+    if len(legs) < 2:
+        return None
+    D = P = 1.0
+    for l in legs:
+        D *= l["decimal"]
+        P *= l["model_prob"]
+    ev = P * (D - 1) - (1 - P)
+    return {"legs": legs, "american": _dec_to_american(D),
+            "prob": P, "ev": ev}
+
+
+def armar_dashboard():
+    juegos = juegos_con_odds()
+    analisis = clv.analisis_recientes()
+    by_match = {}
+    for a in analisis:
+        by_match.setdefault(a["matchup"], []).append(a)
+
+    matchups_hoy = None
+    if isinstance(juegos, list):
+        matchups_hoy = set()
+        for j in juegos:
+            j["analisis"] = by_match.get(j["matchup"], [])
+            matchups_hoy.add(j["matchup"])
+
+    picks = [a for a in analisis if a["is_pick"]
+             and (matchups_hoy is None or a["matchup"] in matchups_hoy)]
+    picks.sort(key=lambda a: a["ev"], reverse=True)
+
+    pick_dia = picks[0] if picks else None
+
+    # Una sola pata por juego (las patas deben ser de juegos distintos)
+    distintos, vistos = [], set()
+    for a in picks:
+        if a["matchup"] not in vistos:
+            distintos.append(a)
+            vistos.add(a["matchup"])
+    dupleta = _parlay(distintos[:2]) if len(distintos) >= 2 else None
+    tripleta = _parlay(distintos[:3]) if len(distintos) >= 3 else None
+
+    return juegos, pick_dia, dupleta, tripleta
 
 
 # ----------------------------- Corrida bajo demanda ------------------------
@@ -174,53 +193,102 @@ PAGINA = """
   th { color:#7d8590; font-weight:500; }
   .err { color:#f85149; }
   .empty { color:#7d8590; font-style:italic; padding:8px 0; }
+  .star { background:#161b22; border:1px solid #3fb950; border-radius:10px;
+          padding:14px; margin-bottom:8px; }
+  .star .big { font-size:1.15rem; font-weight:700; color:#3fb950; }
+  .parlay { background:#161b22; border:1px solid #30363d; border-radius:10px;
+            padding:12px 14px; margin-bottom:8px; }
+  .leg { font-size:.85rem; padding:2px 0; }
+  .combo { font-size:.9rem; margin-top:8px; padding-top:8px;
+           border-top:1px solid #21262d; }
+  .warn { font-size:.76rem; color:#d29922; margin-top:6px; }
+  details.game { background:#161b22; border:1px solid #30363d; border-radius:10px;
+                 margin-bottom:8px; padding:0; }
+  details.game summary { padding:12px 14px; cursor:pointer; list-style:none; }
+  details.game summary::-webkit-details-marker { display:none; }
+  details.game[open] summary { border-bottom:1px solid #21262d; }
+  .gbody { padding:10px 14px 14px; }
+  .team-an { margin:8px 0; padding-left:10px; border-left:2px solid #30363d; }
+  .team-an.pickrow { border-left-color:#3fb950; }
 </style></head><body>
   <h1>⚾ EdgeScout</h1>
   <div class="sub">{{ sport }} · banca ${{ bankroll }} ·
     {% if running %}<span class="pos">analizando…</span>
     {% else %}<a class="btn" href="/analizar">Analizar ahora</a>{% endif %}</div>
 
-  <h2>Juegos de hoy</h2>
+  <h2>Pick del día</h2>
+  {% if pick_dia %}
+    <div class="star">
+      <div class="big">{{ pick_dia.team }}</div>
+      <div class="meta">EV {{ (pick_dia.ev*100)|round(1) }}% ·
+        modelo {{ (pick_dia.model_prob*100)|round(0)|int }}% vs
+        mercado {{ (pick_dia.market_fair*100)|round(0)|int }}% ·
+        stake {{ (pick_dia.stake_pct*100)|round(2) }}%</div>
+      {% if pick_dia.reason %}<div class="meta">{{ pick_dia.reason }}</div>{% endif %}
+      {% for f in pick_dia.factores %}<div class="factor">{{ f }}</div>{% endfor %}
+    </div>
+  {% else %}
+    <div class="empty">Sin pick aun. Corre "Analizar ahora".</div>
+  {% endif %}
+
+  <h2>Dupleta / Tripleta</h2>
+  {% if not dupleta %}
+    <div class="empty">Hacen falta al menos 2 picks de juegos distintos.</div>
+  {% else %}
+    {% for nombre, par in [('Dupleta', dupleta), ('Tripleta', tripleta)] %}
+      {% if par %}
+      <div class="parlay">
+        <div class="pick-team">{{ nombre }}</div>
+        {% for l in par.legs %}<div class="leg">▸ {{ l.team }}
+          <span class="fair">({{ (l.model_prob*100)|round(0)|int }}%)</span></div>{% endfor %}
+        <div class="combo">
+          Cuota combinada <span class="odds">{{ '%+d' % par.american }}</span> ·
+          prob. de ganar <b class="{{ 'neg' if par.prob < 0.4 else '' }}">{{ (par.prob*100)|round(1) }}%</b> ·
+          EV <span class="{{ 'pos' if par.ev>0 else 'neg' }}">{{ (par.ev*100)|round(1) }}%</span>
+        </div>
+        <div class="warn">⚠ La probabilidad de ganar cae mucho y los errores del
+          modelo se multiplican. Mayor varianza que apostar los picks por separado.</div>
+      </div>
+      {% endif %}
+    {% endfor %}
+  {% endif %}
+
+  <h2>Juegos de hoy <span class="sub">(toca para ver el análisis)</span></h2>
   {% if juegos.error %}
     <div class="card err">No se pudieron cargar las odds: {{ juegos.error }}</div>
   {% elif not juegos %}
     <div class="empty">Sin juegos cargados aun.</div>
   {% else %}
     {% for j in juegos %}
-    <div class="card">
-      <div class="matchup">{{ j.matchup }} <span class="hora">· {{ j.hora }}</span></div>
-      {% for e in j.equipos %}
-      <div class="row">
-        <span>{{ e.team }}{% if e.favorito %}<span class="fav">favorito</span>{% endif %}
-          <span class="fair">justa {{ (e.fair*100)|round(1) }}%</span></span>
-        <span class="odds">{{ '%+d' % e.american }} <span class="fair">{{ e.book }}</span></span>
+    <details class="game">
+      <summary>
+        <div class="matchup">{{ j.matchup }} <span class="hora">· {{ j.hora }}</span></div>
+        {% for e in j.equipos %}
+        <div class="row">
+          <span>{{ e.team }}{% if e.favorito %}<span class="fav">favorito</span>{% endif %}
+            <span class="fair">justa {{ (e.fair*100)|round(1) }}%</span></span>
+          <span class="odds">{{ '%+d' % e.american }} <span class="fair">{{ e.book }}</span></span>
+        </div>
+        {% endfor %}
+      </summary>
+      <div class="gbody">
+        {% if not j.analisis %}
+          <div class="empty">Sin análisis aún. Corre "Analizar ahora".</div>
+        {% else %}
+          {% for a in j.analisis %}
+          <div class="team-an {{ 'pickrow' if a.is_pick else '' }}">
+            <div class="pick-team">{{ a.team }}
+              {% if a.is_pick %}<span class="fav">pick · EV {{ (a.ev*100)|round(1) }}%</span>{% endif %}</div>
+            <div class="meta">modelo {{ (a.model_prob*100)|round(0)|int }}% vs
+              mercado {{ (a.market_fair*100)|round(0)|int }}% · datos {{ a.data_quality or 'n/d' }}</div>
+            {% if a.reason %}<div class="meta">{{ a.reason }}</div>{% endif %}
+            {% for f in a.factores %}<div class="factor">{{ f }}</div>{% endfor %}
+            {% if a.weather and a.weather != 'N/A' %}<div class="meta">Clima: {{ a.weather }}</div>{% endif %}
+          </div>
+          {% endfor %}
+        {% endif %}
       </div>
-      {% endfor %}
-    </div>
-    {% endfor %}
-  {% endif %}
-
-  <h2>Recomendaciones registradas</h2>
-  {% if not picks %}
-    <div class="empty">Aun sin recomendaciones. Corre "Analizar ahora".</div>
-  {% else %}
-    {% for p in picks %}
-    <div class="pick-card">
-      <div class="pick-head">
-        <span class="pick-team">{{ p.team }}</span>
-        <span class="pill">{{ p.fecha }} · modelo {{ (p.model_prob*100)|round(0)|int }}%
-          · EV {{ (p.ev*100)|round(1) }}% · stake {{ (p.stake_pct*100)|round(2) }}%</span>
-      </div>
-      {% if p.reason %}<div class="meta">Razon: {{ p.reason }}</div>{% endif %}
-      {% for f in p.factores %}<div class="factor">{{ f }}</div>{% endfor %}
-      <div class="meta">
-        {% if p.weather and p.weather != 'N/A' %}Clima: {{ p.weather }} · {% endif %}
-        datos: {{ p.data_quality or 'n/d' }}
-        {% if p.clv_pct is not none %} · CLV
-          <span class="{{ 'pos' if p.clv_pct>0 else 'neg' }}">{{ p.clv_pct }}%</span>{% endif %}
-        {% if p.result %} · {{ p.result }}{% endif %}
-      </div>
-    </div>
+    </details>
     {% endfor %}
   {% endif %}
 
@@ -241,9 +309,10 @@ PAGINA = """
 
 @app.route("/")
 def home():
+    juegos, pick_dia, dupleta, tripleta = armar_dashboard()
     return render_template_string(
         PAGINA, sport=SPORT, bankroll=int(BANKROLL), running=_running["flag"],
-        juegos=juegos_con_odds(), picks=picks_registrados(),
+        juegos=juegos, pick_dia=pick_dia, dupleta=dupleta, tripleta=tripleta,
         clv=clv.resumen_clv(),
     )
 
