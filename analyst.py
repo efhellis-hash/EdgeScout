@@ -17,7 +17,7 @@ from bankroll import stake_usd, puede_operar
 import time
 import clv
 
-THROTTLE_SEGUNDOS = 8  # pausa entre juegos para no saturar el limite de tokens/min
+THROTTLE_SEGUNDOS = 3  # pausa entre juegos (mas corta: ya hacemos media carga)
 
 
 def analizar_juego(game: dict, sport: str, bankroll: float,
@@ -31,16 +31,27 @@ def analizar_juego(game: dict, sport: str, bankroll: float,
 
     matchup = ml["matchup"]
     equipos = [k for k in ml if k not in ("matchup", "commence_time")]
+    if len(equipos) != 2:
+        return {"error": "Mercado incompleto"}
+
+    # Investigamos UN solo lado (el favorito) y derivamos el otro.
+    # En un mercado de 2 vias, prob(otro) = 1 - prob(favorito). Esto reduce
+    # las llamadas al modelo a la mitad sin perder informacion del partido.
+    fav = max(equipos, key=lambda t: ml[t]["fair_prob"])
+    research = research_team_prob(matchup, sport, fav, ml[fav]["fair_prob"], city)
+    if research.get("error") or research.get("parse_error"):
+        return {"matchup": matchup, "recomendaciones": ["Sin analisis (research fallo)"]}
+
+    prob_fav = research.get("model_prob", ml[fav]["fair_prob"])
+    factores = research.get("key_factors")
+    clima = research.get("weather_impact")
+    razon = research.get("adjustment_reason")
+    calidad = research.get("data_quality")
 
     recomendaciones = []
     for team in equipos:
         info = ml[team]
-        research = research_team_prob(matchup, sport, team,
-                                      info["fair_prob"], city)
-        if research.get("error") or research.get("parse_error"):
-            continue
-
-        model_prob = research.get("model_prob", info["fair_prob"])
+        model_prob = prob_fav if team == fav else (1 - prob_fav)
         veredicto = evaluate(model_prob, info["fair_prob"], info["decimal"])
         es_pick = veredicto["veredicto"] == "PASO"
         stake = (stake_usd(bankroll, model_prob, info["decimal"])
@@ -50,10 +61,7 @@ def analizar_juego(game: dict, sport: str, bankroll: float,
         clv.log_analysis(
             sport, matchup, team, info["decimal"], model_prob,
             info["fair_prob"], veredicto["ev"], stake["stake_pct"], es_pick,
-            factors=research.get("key_factors"),
-            weather=research.get("weather_impact"),
-            reason=research.get("adjustment_reason"),
-            data_quality=research.get("data_quality"),
+            factors=factores, weather=clima, reason=razon, data_quality=calidad,
         )
 
         if not es_pick:
@@ -66,10 +74,10 @@ def analizar_juego(game: dict, sport: str, bankroll: float,
             "ev": f"{veredicto['ev']:.1%}",
             "stake_sugerido": f"{stake['stake_pct']:.2%} de banca "
                               f"(${stake['stake_usd']})",
-            "calidad_datos": research.get("data_quality"),
-            "razon": research.get("adjustment_reason"),
-            "factores": research.get("key_factors"),
-            "clima": research.get("weather_impact"),
+            "calidad_datos": calidad,
+            "razon": razon,
+            "factores": factores,
+            "clima": clima,
             "falta_saber": research.get("missing_info"),
             "nota": "Recomendacion, no orden. Verifica la linea antes de actuar.",
         })
