@@ -49,6 +49,30 @@ def fetch_odds(sport: str) -> list:
     return r.json()
 
 
+def desacuerdo(game: dict) -> float:
+    """Mide cuanto difieren las casas en la prob justa (sin vig) del equipo local.
+    Mayor desacuerdo = linea mas blanda en alguna casa = mejor candidato para
+    gastar el analisis de IA. Es la senal de valor mas honesta SIN modelo."""
+    ref = game.get("home_team")
+    probs = []
+    for book in game.get("bookmakers", []):
+        outcomes = {}
+        for market in book.get("markets", []):
+            if market["key"] != "h2h":
+                continue
+            for o in market["outcomes"]:
+                outcomes[o["name"]] = american_to_decimal(o["price"])
+        if len(outcomes) == 2 and ref in outcomes:
+            names = list(outcomes)
+            fair = devig_two_way(implied_prob(outcomes[names[0]]),
+                                 implied_prob(outcomes[names[1]]))
+            fair_map = dict(zip(names, fair))
+            probs.append(fair_map[ref])
+    if len(probs) < 2:
+        return 0.0
+    return max(probs) - min(probs)
+
+
 def best_moneyline(game: dict):
     """De todas las casas, toma la MEJOR cuota disponible por equipo
     (clave para CLV: apostar al mejor precio) y la prob justa sin vig."""
