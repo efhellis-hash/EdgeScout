@@ -4,6 +4,11 @@ clv.py — Closing Line Value. Tu unico examen honesto de si tienes edge.
 No mide aciertos (eso engana). Mide si conseguiste mejor precio que la linea de
 cierre. Si tu CLV es positivo de forma sostenida sobre una muestra grande,
 tienes algo real. Si no, tu win rate es ilusion. Esto es lo PRIMERO que mides.
+
+CAMBIO 2026-06: se anade la columna `commence_time` (hora de inicio del juego).
+Es la clave que faltaba para distinguir juegos distintos de la MISMA serie
+(ej. Mariners@Tigers viernes vs sabado). Sin ella, el analisis de un juego se
+embarraba sobre todos los juegos de los mismos equipos.
 """
 import os
 import json
@@ -22,6 +27,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS picks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT, sport TEXT, matchup TEXT, team TEXT,
+            commence_time TEXT,     -- hora de inicio del juego (clave anti-duplicado)
             decimal_at_pick REAL, model_prob REAL, ev REAL, stake_pct REAL,
             closing_decimal REAL,   -- se llena tras el cierre
             clv_pct REAL,           -- se calcula al cerrar
@@ -35,8 +41,8 @@ def init_db():
         )
     """)
     # Migracion para bases ya creadas sin las columnas nuevas
-    migraciones = {"factors": "TEXT", "weather": "TEXT", "reason": "TEXT",
-                   "data_quality": "TEXT", "market_fair": "REAL",
+    migraciones = {"commence_time": "TEXT", "factors": "TEXT", "weather": "TEXT",
+                   "reason": "TEXT", "data_quality": "TEXT", "market_fair": "REAL",
                    "is_pick": "INTEGER"}
     for col, tipo in migraciones.items():
         try:
@@ -49,15 +55,22 @@ def init_db():
 
 def log_analysis(sport, matchup, team, decimal_at_pick, model_prob, market_fair,
                  ev, stake_pct, is_pick, factors=None, weather=None,
-                 reason=None, data_quality=None):
+                 reason=None, data_quality=None, commence_time=None):
     """Guarda el analisis de UN equipo (haya pasado o no el filtro).
-    is_pick=1 marca los que son recomendaciones reales."""
+    is_pick=1 marca los que son recomendaciones reales.
+
+    commence_time: hora de inicio del juego en ISO (de la API de odds). Es lo que
+    permite separar juegos distintos de la misma serie. Si llega None, el sistema
+    cae en el comportamiento viejo (agrupar solo por matchup) para no romper datos
+    historicos, pero DEBES pasarlo desde el analyst para que el anti-duplicado
+    funcione."""
     con = sqlite3.connect(DB_PATH)
     cur = con.execute(
-        "INSERT INTO picks (ts, sport, matchup, team, decimal_at_pick, "
-        "model_prob, market_fair, ev, stake_pct, is_pick, factors, weather, "
-        "reason, data_quality) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (dt.datetime.utcnow().isoformat(), sport, matchup, team,
+        "INSERT INTO picks (ts, sport, matchup, team, commence_time, "
+        "decimal_at_pick, model_prob, market_fair, ev, stake_pct, is_pick, "
+        "factors, weather, reason, data_quality) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (dt.datetime.utcnow().isoformat(), sport, matchup, team, commence_time,
          decimal_at_pick, model_prob, market_fair, ev, stake_pct,
          1 if is_pick else 0,
          json.dumps(factors, ensure_ascii=False) if factors else None,
@@ -70,14 +83,19 @@ def log_analysis(sport, matchup, team, decimal_at_pick, model_prob, market_fair,
 
 
 def analisis_recientes():
-    """Devuelve el analisis mas reciente por (matchup, equipo) como lista de dicts."""
+    """Devuelve el analisis mas reciente por (matchup, commence_time, equipo).
+
+    Antes agrupaba solo por (matchup, team), lo que colapsaba todos los juegos de
+    una serie en uno. Ahora cada juego (identificado por su hora de inicio) tiene
+    su propio analisis. Las filas viejas con commence_time NULL siguen agrupandose
+    como antes (SQLite trata los NULL como un solo grupo)."""
     con = sqlite3.connect(DB_PATH)
     try:
         rows = con.execute(
-            "SELECT ts, matchup, team, decimal_at_pick, model_prob, market_fair, "
-            "ev, stake_pct, is_pick, clv_pct, result, factors, weather, reason, "
-            "data_quality FROM picks WHERE id IN "
-            "(SELECT MAX(id) FROM picks GROUP BY matchup, team)"
+            "SELECT ts, matchup, team, commence_time, decimal_at_pick, model_prob, "
+            "market_fair, ev, stake_pct, is_pick, clv_pct, result, factors, weather, "
+            "reason, data_quality FROM picks WHERE id IN "
+            "(SELECT MAX(id) FROM picks GROUP BY matchup, commence_time, team)"
         ).fetchall()
     except Exception:
         con.close()
@@ -86,15 +104,15 @@ def analisis_recientes():
     out = []
     for r in rows:
         try:
-            factores = json.loads(r[11]) if r[11] else []
+            factores = json.loads(r[12]) if r[12] else []
         except Exception:
             factores = []
         out.append({
-            "matchup": r[1], "team": r[2], "decimal": r[3],
-            "model_prob": r[4], "market_fair": r[5], "ev": r[6],
-            "stake_pct": r[7], "is_pick": bool(r[8]), "clv_pct": r[9],
-            "result": r[10], "factores": factores, "weather": r[12],
-            "reason": r[13], "data_quality": r[14],
+            "ts": r[0], "matchup": r[1], "team": r[2], "commence_time": r[3],
+            "decimal": r[4], "model_prob": r[5], "market_fair": r[6], "ev": r[7],
+            "stake_pct": r[8], "is_pick": bool(r[9]), "clv_pct": r[10],
+            "result": r[11], "factores": factores, "weather": r[13],
+            "reason": r[14], "data_quality": r[15],
         })
     return out
 
