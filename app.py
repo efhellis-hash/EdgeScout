@@ -8,6 +8,16 @@ app.py — Dashboard web de EdgeScout + scheduler, en un solo servicio.
 
 Start command en Railway: python app.py
 Reemplaza a scheduler.py (este ya incluye el scheduler).
+
+CAMBIOS 2026-06:
+  [1] El analisis se une al juego por (matchup, commence_time), no solo por
+      matchup. Mata la duplicacion del mismo analisis sobre todos los juegos de
+      una serie. Retrocompatible: filas viejas sin commence_time caen al join por
+      matchup, pero solo si NO existe ningun dato fechado para esa serie.
+  [2] Logos de equipos (CDN de ESPN, con fallback si la imagen no carga).
+  [3] Cada juego/pick muestra CUANDO se analizo (timestamp en hora de Florida).
+  [4] El scheduler respeta el flag _running (antes podia pisar una corrida manual).
+  [5] Bandera "revisar" sobre EV absurdo (>20%): casi siempre es bug, no edge.
 """
 import os
 import json
@@ -30,6 +40,7 @@ BANKROLL = float(os.environ.get("BANKROLL", "1000"))
 RUN_HOUR = int(os.environ.get("RUN_HOUR_UTC", "20"))
 CACHE_SEGUNDOS = 600  # cachea odds 10 min para no quemar el free tier de The Odds API
 TZ = ZoneInfo("America/New_York")  # hora de Florida
+EV_SOSPECHOSO = 0.20  # |EV| sobre esto = probable bug de datos, no oportunidad real
 
 app = Flask(__name__)
 clv.init_db()
@@ -38,13 +49,70 @@ _cache = {"ts": 0, "data": None}
 _running = {"flag": False}
 
 
+# ----------------------------- Logos de equipos ----------------------------
+# CDN publico de ESPN. Si una abreviatura no resuelve, el <img onerror> oculta
+# la imagen y no rompe nada. Ajusta una abreviatura puntual si algun logo no sale.
+TEAM_ABBR = {
+    "Arizona Diamondbacks": "ari", "Atlanta Braves": "atl",
+    "Baltimore Orioles": "bal", "Boston Red Sox": "bos",
+    "Chicago Cubs": "chc", "Chicago White Sox": "chw",
+    "Cincinnati Reds": "cin", "Cleveland Guardians": "cle",
+    "Colorado Rockies": "col", "Detroit Tigers": "det",
+    "Houston Astros": "hou", "Kansas City Royals": "kc",
+    "Los Angeles Angels": "laa", "Los Angeles Dodgers": "lad",
+    "Miami Marlins": "mia", "Milwaukee Brewers": "mil",
+    "Minnesota Twins": "min", "New York Mets": "nym",
+    "New York Yankees": "nyy", "Athletics": "oak",
+    "Oakland Athletics": "oak", "Philadelphia Phillies": "phi",
+    "Pittsburgh Pirates": "pit", "San Diego Padres": "sd",
+    "San Francisco Giants": "sf", "Seattle Mariners": "sea",
+    "St. Louis Cardinals": "stl", "Tampa Bay Rays": "tb",
+    "Texas Rangers": "tex", "Toronto Blue Jays": "tor",
+    "Washington Nationals": "wsh",
+}
+_LOGO_BASE = "https://a.espncdn.com/i/teamlogos/mlb/500/{}.png"
+
+
+def _logo(team):
+    ab = TEAM_ABBR.get(team)
+    return _LOGO_BASE.format(ab) if ab else ""
+
+
 # ----------------------------- Datos --------------------------------------
 def _fmt_hora(iso: str) -> str:
+    """Formatea un ISO (de la API de odds, con Z) a hora de Florida."""
     if not iso:
         return ""
     try:
         t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(TZ)
         return t.strftime("%a %d, %I:%M %p ET")
+    except Exception:
+        return iso
+
+
+def _fmt_utc_ts(iso: str) -> str:
+    """Formatea un timestamp UTC naive (el ts que guarda clv) a hora de Florida."""
+    if not iso:
+        return ""
+    try:
+        t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=dt.timezone.utc)
+        return t.astimezone(TZ).strftime("%a %d, %I:%M %p ET")
+    except Exception:
+        return iso
+
+
+def _norm_ct(iso):
+    """Canonicaliza commence_time a UTC ISO para que matcheen ambos lados del join
+    aunque vengan con 'Z' o '+00:00'."""
+    if not iso:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=dt.timezone.utc)
+        return t.astimezone(dt.timezone.utc).isoformat()
     except Exception:
         return iso
 
@@ -64,15 +132,18 @@ def juegos_con_odds():
             continue
         equipos = [k for k in ml if k not in ("matchup", "commence_time")]
         lista = [{"team": t, "american": ml[t]["american"],
-                  "fair": ml[t]["fair_prob"], "book": ml[t]["book"]}
+                  "fair": ml[t]["fair_prob"], "book": ml[t]["book"],
+                  "logo": _logo(t)}
                  for t in equipos]
         if lista:
             fav = max(lista, key=lambda e: e["fair"])
             for e in lista:
                 e["favorito"] = (e is fav)
+        ct = ml.get("commence_time")
         filas.append({
             "matchup": ml["matchup"],
-            "hora": _fmt_hora(ml.get("commence_time")),
+            "commence_time": ct,            # crudo, para el join
+            "hora": _fmt_hora(ct),
             "equipos": lista,
         })
     _cache["data"] = filas
@@ -103,15 +174,41 @@ def _parlay(legs):
 def armar_dashboard():
     juegos = juegos_con_odds()
     analisis = clv.analisis_recientes()
-    by_match = {}
+
+    # Enriquecer cada fila de analisis (logo + cuando se analizo). pick_dia y las
+    # patas del parlay apuntan a estos mismos dicts, asi que heredan el dato.
+    for a in analisis:
+        a["logo"] = _logo(a["team"])
+        a["analizado"] = _fmt_utc_ts(a.get("ts"))
+
+    # Indices para el join. Preferimos (matchup, commence_time); las filas viejas
+    # sin commence_time van al indice por matchup (fallback retrocompatible).
+    by_key = {}      # (matchup, commence_time_norm) -> [rows]
+    by_match = {}    # matchup -> [rows]
     for a in analisis:
         by_match.setdefault(a["matchup"], []).append(a)
+        ct = _norm_ct(a.get("commence_time"))
+        if ct:
+            by_key.setdefault((a["matchup"], ct), []).append(a)
 
     matchups_hoy = None
     if isinstance(juegos, list):
         matchups_hoy = set()
         for j in juegos:
-            j["analisis"] = by_match.get(j["matchup"], [])
+            key = (j["matchup"], _norm_ct(j.get("commence_time")))
+            if key in by_key:
+                # Caso correcto: analisis fechado que corresponde a ESTE juego.
+                j["analisis"] = by_key[key]
+            else:
+                rows = by_match.get(j["matchup"], [])
+                # Solo usamos el fallback por matchup si TODAS las filas de esa
+                # serie son viejas (sin fecha). Si ya hay datos fechados para la
+                # serie pero ninguno casa con este juego, es que este juego no se
+                # analizo: mejor mostrarlo vacio que embarrar el analisis de otro.
+                if rows and all(not r.get("commence_time") for r in rows):
+                    j["analisis"] = rows
+                else:
+                    j["analisis"] = []
             matchups_hoy.add(j["matchup"])
         # Los juegos analizados (con datos) primero
         juegos.sort(key=lambda j: len(j.get("analisis", [])), reverse=True)
@@ -125,9 +222,10 @@ def armar_dashboard():
     # Una sola pata por juego (las patas deben ser de juegos distintos)
     distintos, vistos = [], set()
     for a in picks:
-        if a["matchup"] not in vistos:
+        clave = (a["matchup"], _norm_ct(a.get("commence_time")))
+        if clave not in vistos:
             distintos.append(a)
-            vistos.add(a["matchup"])
+            vistos.add(clave)
     dupleta = _parlay(distintos[:2]) if len(distintos) >= 2 else None
     tripleta = _parlay(distintos[:3]) if len(distintos) >= 3 else None
 
@@ -171,9 +269,11 @@ PAGINA = """
   .matchup { font-weight:600; margin-bottom:6px; }
   .hora { color:#7d8590; font-weight:400; font-size:.8rem; }
   .row { display:flex; justify-content:space-between; padding:3px 0;
-         font-size:.9rem; }
+         font-size:.9rem; align-items:center; }
   .odds { color:#58a6ff; font-variant-numeric:tabular-nums; }
   .fair { color:#7d8590; font-size:.8rem; }
+  .logo { width:18px; height:18px; vertical-align:middle; margin-right:6px;
+          object-fit:contain; }
   .fav { background:#1f6feb33; color:#79c0ff; font-size:.65rem; font-weight:600;
          padding:1px 6px; border-radius:6px; margin-left:6px;
          text-transform:uppercase; letter-spacing:.04em; }
@@ -187,6 +287,9 @@ PAGINA = """
             position:relative; }
   .factor:before { content:"▸"; position:absolute; left:0; color:#3fb950; }
   .meta { font-size:.78rem; color:#7d8590; margin-top:6px; }
+  .anlz { font-size:.72rem; color:#7d8590; margin-top:6px;
+          border-top:1px solid #21262d; padding-top:6px; }
+  .suspect { color:#d29922; font-weight:600; font-size:.72rem; margin-left:6px; }
   .btn { display:inline-block; background:#238636; color:#fff; padding:8px 14px;
          border-radius:8px; text-decoration:none; font-size:.9rem; }
   .clv { background:#161b22; border:1px solid #30363d; border-radius:10px;
@@ -223,13 +326,15 @@ PAGINA = """
   <h2>Pick del día</h2>
   {% if pick_dia %}
     <div class="star">
-      <div class="big">{{ pick_dia.team }}</div>
-      <div class="meta">EV {{ (pick_dia.ev*100)|round(1) }}% ·
+      <div class="big"><img class="logo" src="{{ pick_dia.logo }}"
+        onerror="this.style.display='none'">{{ pick_dia.team }}</div>
+      <div class="meta">EV {{ (pick_dia.ev*100)|round(1) }}%{% if pick_dia.ev|abs > ev_sosp %}<span class="suspect">⚠ revisar</span>{% endif %} ·
         modelo {{ (pick_dia.model_prob*100)|round(0)|int }}% vs
         mercado {{ (pick_dia.market_fair*100)|round(0)|int }}% ·
         stake {{ (pick_dia.stake_pct*100)|round(2) }}%</div>
       {% if pick_dia.reason %}<div class="meta">{{ pick_dia.reason }}</div>{% endif %}
       {% for f in pick_dia.factores %}<div class="factor">{{ f }}</div>{% endfor %}
+      {% if pick_dia.analizado %}<div class="anlz">Analizado: {{ pick_dia.analizado }}</div>{% endif %}
     </div>
   {% else %}
     <div class="empty">Sin pick aun. Corre "Analizar ahora".</div>
@@ -243,7 +348,8 @@ PAGINA = """
       {% if par %}
       <div class="parlay">
         <div class="pick-team">{{ nombre }}</div>
-        {% for l in par.legs %}<div class="leg">▸ {{ l.team }}
+        {% for l in par.legs %}<div class="leg">▸ <img class="logo" src="{{ l.logo }}"
+          onerror="this.style.display='none'">{{ l.team }}
           <span class="fair">({{ (l.model_prob*100)|round(0)|int }}%)</span></div>{% endfor %}
         <div class="combo">
           Cuota combinada <span class="odds">{{ '%+d' % par.american }}</span> ·
@@ -269,7 +375,7 @@ PAGINA = """
         <div class="matchup">{{ j.matchup }} <span class="hora">· {{ j.hora }}</span></div>
         {% for e in j.equipos %}
         <div class="row">
-          <span>{{ e.team }}{% if e.favorito %}<span class="fav">favorito</span>{% endif %}
+          <span><img class="logo" src="{{ e.logo }}" onerror="this.style.display='none'">{{ e.team }}{% if e.favorito %}<span class="fav">favorito</span>{% endif %}
             <span class="fair">justa {{ (e.fair*100)|round(1) }}%</span></span>
           <span class="odds">{{ '%+d' % e.american }} <span class="fair">{{ e.book }}</span></span>
         </div>
@@ -286,12 +392,15 @@ PAGINA = """
           <div class="meta">Calidad de datos: {{ a0.data_quality or 'n/d' }}</div>
           {% for a in j.analisis %}
           <div class="team-an {{ 'pickrow' if a.is_pick else '' }}">
-            <span class="pick-team">{{ a.team }}</span> —
+            <span class="pick-team"><img class="logo" src="{{ a.logo }}"
+              onerror="this.style.display='none'">{{ a.team }}</span> —
             modelo {{ (a.model_prob*100)|round(0)|int }}% vs mercado {{ (a.market_fair*100)|round(0)|int }}%
             · EV <span class="{{ 'pos' if a.ev>0 else 'neg' }}">{{ (a.ev*100)|round(1) }}%</span>
+            {% if a.ev|abs > ev_sosp %}<span class="suspect">⚠ revisar</span>{% endif %}
             {% if a.is_pick %}<span class="fav">PICK</span>{% endif %}
           </div>
           {% endfor %}
+          {% if a0.analizado %}<div class="anlz">Analizado: {{ a0.analizado }}</div>{% endif %}
         {% endif %}
       </div>
     </details>
@@ -320,7 +429,7 @@ def debug():
         total = con.execute("SELECT COUNT(*) FROM picks").fetchone()[0]
         picks = con.execute("SELECT COUNT(*) FROM picks WHERE is_pick=1").fetchone()[0]
         ult = con.execute(
-            "SELECT ts, matchup, team, model_prob, ev, is_pick "
+            "SELECT ts, commence_time, matchup, team, model_prob, ev, is_pick "
             "FROM picks ORDER BY id DESC LIMIT 6").fetchall()
         con.close()
         return {"db_path": DB_PATH, "total_analisis": total,
@@ -335,13 +444,17 @@ def home():
     return render_template_string(
         PAGINA, sport=SPORT, bankroll=int(BANKROLL), running=_running["flag"],
         juegos=juegos, pick_dia=pick_dia, dupleta=dupleta, tripleta=tripleta,
-        clv=clv.resumen_clv(),
+        clv=clv.resumen_clv(), ev_sosp=EV_SOSPECHOSO,
     )
 
 
 # ----------------------------- Scheduler en background ---------------------
 def _job():
-    correr_dia(SPORT, BANKROLL)
+    # Respeta el flag: si hay una corrida manual en curso, no la pisa.
+    if _running["flag"]:
+        print("[EdgeScout] cron saltado: ya hay una corrida en curso")
+        return
+    _run_analysis()
 
 
 sched = BackgroundScheduler(timezone="UTC")
