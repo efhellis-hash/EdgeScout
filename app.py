@@ -18,6 +18,7 @@ CAMBIOS 2026-06:
   [3] Cada juego/pick muestra CUANDO se analizo (timestamp en hora de Florida).
   [4] El scheduler respeta el flag _running (antes podia pisar una corrida manual).
   [5] Bandera "revisar" sobre EV absurdo (>20%): casi siempre es bug, no edge.
+  [6] Endpoint /historial: ver picks y rechazados de cualquier fecha (hora ET).
 """
 import os
 import json
@@ -317,8 +318,9 @@ PAGINA = """
   .gbody { padding:10px 14px 14px; }
   .team-an { margin:8px 0; padding-left:10px; border-left:2px solid #30363d; }
   .team-an.pickrow { border-left-color:#3fb950; }
+  .toplink { float:right; font-size:.8rem; }
 </style></head><body>
-  <h1>⚾ EdgeScout</h1>
+  <h1>⚾ EdgeScout <a class="toplink" href="/historial">historial ▸</a></h1>
   <div class="sub">{{ sport }} · banca ${{ bankroll }} ·
     {% if running %}<span class="pos">analizando…</span>
     {% else %}<a class="btn" href="/analizar">Analizar ahora</a>{% endif %}</div>
@@ -436,6 +438,113 @@ def debug():
                 "total_picks": picks, "ultimos": ult}
     except Exception as e:
         return {"db_path": DB_PATH, "error": f"{type(e).__name__}: {e}"}
+
+
+# ----------------------------- Historial por fecha -------------------------
+# Muestra picks calificados y rechazados de cualquier dia. Filtra por la fecha
+# en hora de Florida (el ts se guarda en UTC), asi "ayer" no se parte a medianoche.
+HISTORIAL = """
+<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EdgeScout · Historial</title>
+<style>
+  :root { color-scheme: dark; } * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+         background:#0d1117; color:#e6edf3; padding:16px; }
+  h1 { font-size:1.3rem; margin:0 0 4px; } a { color:#58a6ff; text-decoration:none; }
+  h2 { font-size:.95rem; color:#7d8590; margin:20px 0 8px;
+       text-transform:uppercase; letter-spacing:.05em; }
+  .nav { margin:8px 0 16px; font-size:.9rem; color:#7d8590; }
+  .nav a { margin:0 2px; }
+  .row { background:#161b22; border:1px solid #30363d; border-radius:8px;
+         padding:8px 12px; margin-bottom:6px; font-size:.88rem; }
+  .row.pick { border-left:3px solid #3fb950; }
+  .pos { color:#3fb950; } .neg { color:#f85149; }
+  .pill { background:#1f6feb33; color:#79c0ff; font-size:.65rem; padding:1px 6px;
+          border-radius:6px; margin-left:6px; }
+  .suspect { color:#d29922; font-weight:600; font-size:.72rem; margin-left:6px; }
+  .empty { color:#7d8590; font-style:italic; padding:6px 0; }
+  .err { color:#f85149; }
+  .mu { color:#7d8590; }
+</style></head><body>
+  <h1>⚾ Historial · {{ fecha }}</h1>
+  <div class="nav">
+    <a href="/historial/{{ ayer }}">◀ {{ ayer }}</a> ·
+    <a href="/">inicio</a> ·
+    <a href="/historial/{{ manana }}">{{ manana }} ▶</a>
+    &nbsp;·&nbsp; {{ total }} análisis ese día
+  </div>
+
+  {% if error %}
+    <div class="row err">Error: {{ error }}</div>
+  {% else %}
+    <h2>Picks calificados ({{ picks|length }})</h2>
+    {% if not picks %}<div class="empty">Ningún pick pasó el filtro ese día.</div>{% endif %}
+    {% for r in picks %}
+      <div class="row pick">
+        <b>{{ r.team }}</b> <span class="mu">· {{ r.matchup }}</span><span class="pill">PICK</span><br>
+        modelo {{ (r.model_prob*100)|round(0)|int }}% ·
+        EV <span class="{{ 'pos' if r.ev>0 else 'neg' }}">{{ (r.ev*100)|round(1) }}%</span>
+        {% if r.ev|abs > ev_sosp %}<span class="suspect">⚠ revisar</span>{% endif %}
+      </div>
+    {% endfor %}
+
+    <h2>Rechazados ({{ resto|length }})</h2>
+    {% if not resto %}<div class="empty">Sin análisis rechazados ese día.</div>{% endif %}
+    {% for r in resto %}
+      <div class="row">
+        {{ r.team }} <span class="mu">· {{ r.matchup }}</span> —
+        EV <span class="{{ 'pos' if r.ev>0 else 'neg' }}">{{ (r.ev*100)|round(1) }}%</span>
+      </div>
+    {% endfor %}
+  {% endif %}
+</body></html>
+"""
+
+
+@app.route("/historial")
+@app.route("/historial/<fecha>")
+def historial(fecha=None):
+    hoy_et = dt.datetime.now(TZ).date()
+    try:
+        objetivo = dt.date.fromisoformat(fecha) if fecha else hoy_et - dt.timedelta(days=1)
+    except ValueError:
+        objetivo = hoy_et - dt.timedelta(days=1)
+
+    ayer = (objetivo - dt.timedelta(days=1)).isoformat()
+    manana = (objetivo + dt.timedelta(days=1)).isoformat()
+
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT ts, matchup, team, model_prob, ev, is_pick "
+            "FROM picks ORDER BY id DESC LIMIT 1000").fetchall()
+        con.close()
+    except Exception as e:
+        return render_template_string(
+            HISTORIAL, fecha=objetivo.isoformat(), picks=[], resto=[], total=0,
+            ev_sosp=EV_SOSPECHOSO, ayer=ayer, manana=manana,
+            error=f"{type(e).__name__}: {e}")
+
+    def ts_a_et(ts):
+        if not ts:
+            return None
+        try:
+            t = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=dt.timezone.utc)
+            return t.astimezone(TZ)
+        except Exception:
+            return None
+
+    dia = [r for r in rows if (e := ts_a_et(r["ts"])) and e.date() == objetivo]
+    picks = sorted([r for r in dia if r["is_pick"]], key=lambda r: r["ev"], reverse=True)
+    resto = sorted([r for r in dia if not r["is_pick"]], key=lambda r: r["ev"], reverse=True)
+
+    return render_template_string(
+        HISTORIAL, fecha=objetivo.isoformat(), picks=picks, resto=resto,
+        total=len(dia), ev_sosp=EV_SOSPECHOSO, ayer=ayer, manana=manana, error=None)
 
 
 @app.route("/")
