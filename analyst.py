@@ -38,11 +38,12 @@ def analizar_juego(game: dict, sport: str, bankroll: float,
     if len(equipos) != 2:
         return {"error": "Mercado incompleto"}
 
+    n_books = ml.get("n_books", 0)
     recomendaciones = []
     for team in equipos:
         info = ml[team]
-        fair = info["fair_prob"]                 # prob justa de consenso sharp
-        veredicto = evaluate(fair, info["decimal"])
+        fair = info["fair_prob"]                 # prob justa de consenso (otras casas)
+        veredicto = evaluate(fair, info["decimal"], n_books)
         es_pick = veredicto["veredicto"] == "PASO"
         stake = (stake_usd(bankroll, fair, info["decimal"])
                  if es_pick else {"stake_pct": 0.0, "stake_usd": 0.0})
