@@ -79,21 +79,37 @@ def log_analysis(sport, matchup, team, decimal_at_pick, model_prob, market_fair,
 
 
 def analisis_recientes():
-    """Analisis mas reciente por (matchup, commence_time, equipo)."""
+    """El análisis MÁS RECIENTE por (matchup, commence_time, equipo).
+
+    Con varias corridas al día (cron 13-17 UTC), un mismo juego se analiza varias
+    veces. El GROUP BY de SQL no basta porque commence_time puede variar de formato
+    entre corridas (Z vs +00:00, segundos), y entonces deja pasar duplicados. Aquí
+    traemos TODO ordenado por id desc y nos quedamos con el primero (más nuevo) de
+    cada (matchup, commence_time_normalizado, equipo). Eso garantiza un único
+    análisis por juego-equipo, sin duplicados en pantalla."""
     con = sqlite3.connect(DB_PATH)
     try:
         rows = con.execute(
             "SELECT ts, matchup, team, commence_time, decimal_at_pick, model_prob, "
             "market_fair, ev, stake_pct, is_pick, clv_pct, result, factors, weather, "
-            "reason, data_quality FROM picks WHERE id IN "
-            "(SELECT MAX(id) FROM picks GROUP BY matchup, commence_time, team)"
+            "reason, data_quality FROM picks ORDER BY id DESC"
         ).fetchall()
     except Exception:
         con.close()
         return []
     con.close()
+
+    def _norm(iso):
+        t = _parse_utc(iso)
+        return t.isoformat() if t else (iso or "")
+
     out = []
+    vistos = set()
     for r in rows:
+        clave = (r[1], _norm(r[3]), r[2])   # matchup, commence_time norm, team
+        if clave in vistos:
+            continue                         # ya tenemos el más reciente de este
+        vistos.add(clave)
         try:
             factores = json.loads(r[12]) if r[12] else []
         except Exception:
