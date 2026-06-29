@@ -1,30 +1,28 @@
 """
 odds.py — Lineas del mercado + matematica honesta de probabilidad.
 
-Aqui esta el baseline que NINGUN modelo debe ignorar: la probabilidad
-implicita SIN vig del mercado. Es lo que el mercado realmente cree, y es
-brutalmente dificil de superar. Tu "modelo" arranca desde aqui, no desde cero.
+MODO MERCADO / LINE SHOPPING (correccion 2026-06):
+  El error que se arregla: antes se devigaba y se comparaba contra la MISMA casa,
+  asi que el vig nunca se iba y TODO daba ~-2.3% (el vig promedio). Imposible
+  encontrar valor: comparabas una casa contra si misma.
 
-CAMBIO 2026-06 (correccion de pricing):
-  El devig ahora se hace DENTRO de cada casa (sus dos patas) y luego se toma
-  un consenso. ANTES se cruzaban casas (mejor cuota de A de DraftKings + mejor
-  cuota de B de FanDuel) y se les quitaba el vig juntas: eso es invalido, la
-  suma podia bajar de 1.0 y la "prob justa" salia deformada — y peor, se
-  deformaba JUSTO en los juegos de mas desacuerdo, que son los que el sistema
-  elige. Ahora:
-    - fair_prob  = consenso de las casas (ancla sharp si hay Pinnacle/Circa,
-                   si no la mediana por equipo, robusta a casas blandas).
-    - american/decimal/book = MEJOR precio disponible por equipo (line shopping,
-                   sin cambios) -> esto es lo que apuestas y lo que mide el CLV.
-  El EV honesto = mejor precio disponible  vs  prob justa de consenso.
+  La forma correcta del line shopping:
+    - prob justa = CONSENSO de las OTRAS casas (excluyendo la que da el mejor
+      precio para ese equipo). Esa es la "verdad" del mercado.
+    - precio que apuestas = el MEJOR precio individual disponible.
+    - hay edge cuando UNA casa se sale del consenso y te paga de mas.
+  Asi el fair y el precio NUNCA salen de la misma fuente, y el vig deja de
+  contaminar el EV.
+
+  Tambien expone n_books (cuantas casas formaron el consenso) para que value.py
+  exija una muestra minima: un "consenso" de 2 casas no es consenso, es ruido.
 """
 import statistics
 import requests
 from config import THE_ODDS_API_KEY, SPORT_KEYS, MERCADOS, REGIONES
 
-# Casas afiladas: si alguna esta presente, su linea (ya sin vig) es mejor ancla
-# que el promedio de todo el mercado. Pinnacle vive en la region 'eu' de The Odds
-# API; si tu REGIONES no la incluye, simplemente se cae al consenso por mediana.
+# Casas afiladas: si alguna esta presente, su linea (ya sin vig) es mejor ancla.
+# Con REGIONES='us' normalmente NO aparece Pinnacle; el sistema cae al consenso.
 SHARP_BOOKS = ("pinnacle", "circa", "betonline")
 
 
@@ -41,16 +39,13 @@ def implied_prob(decimal_odds: float) -> float:
 
 
 def devig_two_way(p1: float, p2: float):
-    """Quita el vig de un mercado de dos vias (metodo proporcional).
-    Devuelve las probabilidades 'justas' que suman 1.0."""
+    """Quita el vig de un mercado de dos vias (metodo proporcional)."""
     total = p1 + p2
     return p1 / total, p2 / total
 
 
 # ---- Descarga de lineas ---------------------------------------------------
 def fetch_odds(sport: str) -> list:
-    """Trae odds actuales (ML, spread, totales) para todos los juegos del dia.
-    Devuelve la estructura cruda de The Odds API."""
     if not THE_ODDS_API_KEY:
         raise RuntimeError("THE_ODDS_API_KEY no configurada")
     sport_key = SPORT_KEYS[sport]
@@ -68,11 +63,10 @@ def fetch_odds(sport: str) -> list:
     return r.json()
 
 
-# ---- Probabilidad justa (devig por casa, CORRECTO) ------------------------
+# ---- Probabilidad justa por casa (devig dentro de cada casa) --------------
 def _fair_by_book(game: dict) -> list:
-    """Para cada casa con mercado h2h de 2 vias, quita el vig DENTRO de esa misma
-    casa y devuelve {equipo: prob_justa, '_book': nombre}. Esta es la unica forma
-    valida de sacar prob justa: nunca se mezclan precios de casas distintas."""
+    """Para cada casa con h2h de 2 vias, quita el vig DENTRO de esa misma casa.
+    Devuelve [{equipo: prob_justa, '_book': nombre}, ...]."""
     out = []
     for book in game.get("bookmakers", []):
         dec = {}
@@ -90,38 +84,8 @@ def _fair_by_book(game: dict) -> list:
     return out
 
 
-def _consenso_fair(fairs: list):
-    """Consenso de prob justa por equipo.
-      1) Si hay casa sharp (Pinnacle/Circa/BetOnline), su devig es el ancla.
-      2) Si no, mediana por equipo (resiste casas blandas que jalan la linea).
-    Renormaliza para que sume 1.0. Devuelve dict con probs, fuente y n de casas."""
-    if not fairs:
-        return None
-    equipos = [k for k in fairs[0] if k != "_book"]
-
-    # 1) ancla sharp
-    for f in fairs:
-        if any(s in f["_book"].lower() for s in SHARP_BOOKS):
-            anchor = {t: f[t] for t in equipos if t in f}
-            if len(anchor) == 2:
-                return {"probs": anchor, "fuente": f["_book"], "n": len(fairs)}
-
-    # 2) mediana por equipo + renormalizacion
-    med = {}
-    for t in equipos:
-        vals = [f[t] for f in fairs if t in f]
-        if vals:
-            med[t] = statistics.median(vals)
-    s = sum(med.values())
-    if s > 0:
-        med = {t: v / s for t, v in med.items()}
-    return {"probs": med, "fuente": f"consenso {len(fairs)} casas", "n": len(fairs)}
-
-
 def desacuerdo(game: dict) -> float:
-    """Cuanto difieren las casas en la prob justa (sin vig) del equipo local.
-    Mayor desacuerdo = linea mas blanda en alguna casa = mejor candidato para
-    gastar el analisis. Reusa el devig por-casa (la forma correcta)."""
+    """Cuanto difieren las casas en la prob justa del equipo local."""
     ref = game.get("home_team")
     probs = [f[ref] for f in _fair_by_book(game) if ref in f]
     if len(probs) < 2:
@@ -129,18 +93,31 @@ def desacuerdo(game: dict) -> float:
     return max(probs) - min(probs)
 
 
+def _consenso_excluyendo(fairs: list, equipo: str, book_excluir: str):
+    """Prob justa de consenso para `equipo`, EXCLUYENDO la casa `book_excluir`
+    (la que da el mejor precio para ese equipo). Asi el fair y el precio nunca
+    salen de la misma fuente.
+
+    Ancla sharp si alguna de las casas restantes lo es; si no, mediana.
+    Devuelve (prob, n_casas_usadas) o (None, 0) si no hay con quien comparar."""
+    restantes = [f for f in fairs if f.get("_book") != book_excluir and equipo in f]
+    if not restantes:
+        return None, 0
+
+    # ancla sharp entre las restantes
+    for f in restantes:
+        if any(s in f["_book"].lower() for s in SHARP_BOOKS):
+            return f[equipo], len(restantes)
+
+    vals = [f[equipo] for f in restantes]
+    return statistics.median(vals), len(restantes)
+
+
 def best_moneyline(game: dict):
-    """Devuelve, por equipo:
-      - american/decimal/book : el MEJOR precio disponible (line shopping). Es lo
-        que apuestas y lo que compara el CLV. (sin cambios respecto a la version
-        anterior).
-      - fair_prob : prob justa de CONSENSO (devig por casa). ESTE es el arreglo:
-        antes salia de cruzar mejores precios de casas distintas, lo cual deforma
-        la probabilidad. Ahora es honesta.
-    Mantiene EXACTAMENTE el mismo contrato que la version original (solo llaves de
-    equipos + matchup + commence_time), porque los callers identifican a los
-    equipos como 'todo lo que no sea matchup/commence_time'."""
-    # --- mejor precio por equipo (no cambia) ---
+    """Por equipo: mejor precio individual (line shopping) + prob justa de
+    consenso de las OTRAS casas. Expone n_books = tamano minimo del consenso
+    entre ambos equipos (para que value.py filtre por muestra)."""
+    # --- mejor precio por equipo + de que casa salio ---
     teams = {}
     for book in game.get("bookmakers", []):
         for market in book.get("markets", []):
@@ -155,18 +132,23 @@ def best_moneyline(game: dict):
     if len(teams) != 2:
         return None
 
-    # --- prob justa de consenso (devig por casa) ---
-    cons = _consenso_fair(_fair_by_book(game))
-    if not cons:
+    fairs = _fair_by_book(game)
+    if not fairs:
         return None
-    probs = cons["probs"]
 
     res = {}
+    n_min = None
     for name, d in teams.items():
-        # si por alguna razon el consenso no cubre a un equipo, cae a su implicita
-        fair = probs.get(name, implied_prob(d["decimal"]))
+        fair, n = _consenso_excluyendo(fairs, name, d["book"])
+        if fair is None:
+            # No hay otra casa con quien comparar: cae a su propia implicita
+            # (esto NO dara edge, es el caso degenerado de una sola casa).
+            fair = implied_prob(d["decimal"])
+            n = 0
         res[name] = {**d, "fair_prob": round(fair, 4)}
+        n_min = n if n_min is None else min(n_min, n)
 
     res["matchup"] = f"{game.get('away_team')} @ {game.get('home_team')}"
     res["commence_time"] = game.get("commence_time")
+    res["n_books"] = n_min or 0
     return res
