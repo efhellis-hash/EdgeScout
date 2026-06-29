@@ -1,28 +1,30 @@
 """
-analyst.py — Orquestador del AI Sports Analyst.
+analyst.py — Orquestador en MODO MERCADO (line shopping puro).
 
-Flujo (en el orden CORRECTO, CLV-first):
-  1. Trae lineas y calcula prob justa sin vig (ancla del mercado).
-  2. El agente investiga (pitchers, lesiones, clima, forma) y ajusta la prob.
-  3. value.py decide si hay valor real o es error de modelo (humildad de calibracion).
-  4. bankroll.py sugiere stake con tope; respeta limite de perdida diaria.
-  5. clv.py registra el pick para medir CLV (el unico juez honesto del edge).
+Cambio (2026-06): se ELIMINA el research con Haiku. EdgeScout ya no intenta
+predecir mejor que el mercado; busca cuando la MEJOR cuota disponible paga por
+encima del consenso sharp sin vig. Eso es edge real y medible (CLV), no opinion.
+
+Flujo:
+  1. fetch_odds trae las lineas de TODOS los juegos del dia.
+  2. best_moneyline da, por equipo: prob justa de consenso + mejor cuota disponible.
+  3. value.evaluate decide si la mejor cuota supera al consenso (EV > minimo).
+  4. bankroll.py sugiere stake con tope.
+  5. clv.py registra el pick para medir CLV (el juez honesto del edge).
+
+Sin Haiku => sin llamadas a la API de modelo, sin throttle, sin elegir "los 3
+juegos de mas desacuerdo". El line shopping es barato: se evaluan TODOS los juegos.
 
 RECOMIENDA, NUNCA EJECUTA. Tu decides. La maquina no toca tu dinero.
 """
-from odds import fetch_odds, best_moneyline, desacuerdo
-from research import research_team_prob
+from odds import fetch_odds, best_moneyline
 from value import evaluate
 from bankroll import stake_usd, puede_operar
-import os
-import time
 import clv
-
-THROTTLE_SEGUNDOS = 3  # pausa entre juegos (mas corta: ya hacemos media carga)
 
 
 def analizar_juego(game: dict, sport: str, bankroll: float,
-                   perdida_hoy: float = 0.0, city: str = None) -> dict:
+                   perdida_hoy: float = 0.0) -> dict:
     if not puede_operar(perdida_hoy, bankroll):
         return {"bloqueado": "Limite de perdida diaria alcanzado. No se opera hoy."}
 
@@ -31,55 +33,43 @@ def analizar_juego(game: dict, sport: str, bankroll: float,
         return {"error": "Mercado moneyline incompleto"}
 
     matchup = ml["matchup"]
+    commence_time = ml.get("commence_time")
     equipos = [k for k in ml if k not in ("matchup", "commence_time")]
     if len(equipos) != 2:
         return {"error": "Mercado incompleto"}
 
-    # Investigamos UN solo lado (el favorito) y derivamos el otro.
-    # En un mercado de 2 vias, prob(otro) = 1 - prob(favorito). Esto reduce
-    # las llamadas al modelo a la mitad sin perder informacion del partido.
-    fav = max(equipos, key=lambda t: ml[t]["fair_prob"])
-    research = research_team_prob(matchup, sport, fav, ml[fav]["fair_prob"], city)
-    if research.get("error") or research.get("parse_error"):
-        return {"matchup": matchup, "recomendaciones": ["Sin analisis (research fallo)"]}
-
-    prob_fav = research.get("model_prob", ml[fav]["fair_prob"])
-    factores = research.get("key_factors")
-    clima = research.get("weather_impact")
-    razon = research.get("adjustment_reason")
-    calidad = research.get("data_quality")
-
     recomendaciones = []
     for team in equipos:
         info = ml[team]
-        model_prob = prob_fav if team == fav else (1 - prob_fav)
-        veredicto = evaluate(model_prob, info["fair_prob"], info["decimal"])
+        fair = info["fair_prob"]                 # prob justa de consenso sharp
+        veredicto = evaluate(fair, info["decimal"])
         es_pick = veredicto["veredicto"] == "PASO"
-        stake = (stake_usd(bankroll, model_prob, info["decimal"])
+        stake = (stake_usd(bankroll, fair, info["decimal"])
                  if es_pick else {"stake_pct": 0.0, "stake_usd": 0.0})
 
-        # Guardamos SIEMPRE el analisis (para poder desplegar cada juego)
+        # Guardamos SIEMPRE el analisis. En modo mercado no hay model_prob propio:
+        # registramos la prob de consenso en ambas columnas (model_prob y market_fair)
+        # para no romper la BD ni el dashboard, que esperan esas columnas.
         clv.log_analysis(
-            sport, matchup, team, info["decimal"], model_prob,
-            info["fair_prob"], veredicto["ev"], stake["stake_pct"], es_pick,
-            factors=factores, weather=clima, reason=razon, data_quality=calidad,
+            sport, matchup, team, info["decimal"], fair, fair,
+            veredicto["ev"], stake["stake_pct"], es_pick,
+            factors=[f"Mejor precio: {info['book']} ({info['american']:+d})"],
+            weather=None,
+            reason=("Valor de line shopping: la mejor cuota disponible paga por "
+                    "encima del consenso sharp sin vig." if es_pick else None),
+            data_quality="mercado",
+            commence_time=commence_time,
         )
 
         if not es_pick:
-            continue  # se guardo el analisis, pero no es recomendacion
+            continue
 
         recomendaciones.append({
             "pick": f"{team} ML @ {info['american']:+d} ({info['book']})",
-            "prob_modelo": f"{model_prob:.1%}",
-            "prob_mercado_justa": f"{info['fair_prob']:.1%}",
+            "prob_mercado_justa": f"{fair:.1%}",
             "ev": f"{veredicto['ev']:.1%}",
             "stake_sugerido": f"{stake['stake_pct']:.2%} de banca "
                               f"(${stake['stake_usd']})",
-            "calidad_datos": calidad,
-            "razon": razon,
-            "factores": factores,
-            "clima": clima,
-            "falta_saber": research.get("missing_info"),
             "nota": "Recomendacion, no orden. Verifica la linea antes de actuar.",
         })
 
@@ -91,26 +81,18 @@ def analizar_juego(game: dict, sport: str, bankroll: float,
 def correr_dia(sport: str, bankroll: float, perdida_hoy: float = 0.0):
     clv.init_db()
     juegos = fetch_odds(sport)
-    # Elegir los juegos donde el mercado MAS difiere entre casas (linea blanda).
-    # Ahi gastamos el analisis de IA. Top N por desacuerdo. 0 = todos.
-    top_n = int(os.environ.get("MAX_JUEGOS", "3"))
-    juegos = sorted(juegos, key=desacuerdo, reverse=True)
-    if top_n:
-        juegos = juegos[:top_n]
+    # Sin Haiku, el line shopping es barato: evaluamos TODOS los juegos del dia.
     salida = []
     for i, g in enumerate(juegos, 1):
-        d = desacuerdo(g)
-        print(f"[EdgeScout] juego {i}/{len(juegos)} "
-              f"(desacuerdo casas: {d*100:.1f}%)")
+        print(f"[EdgeScout] juego {i}/{len(juegos)}")
         salida.append(analizar_juego(g, sport, bankroll, perdida_hoy))
-        time.sleep(THROTTLE_SEGUNDOS)
-    print("[EdgeScout] corrida completa")
+    print("[EdgeScout] corrida completa (modo mercado)")
     return salida
 
 
 if __name__ == "__main__":
     import json
-    BANKROLL = 1000.0  # tu banca real en USD
+    BANKROLL = 1000.0
     resultados = correr_dia("MLB", BANKROLL)
     print(json.dumps(resultados, indent=2, ensure_ascii=False))
     print("\n--- CLV acumulado ---")
