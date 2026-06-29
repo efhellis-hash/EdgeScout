@@ -34,7 +34,7 @@ def analizar_juego(game: dict, sport: str, bankroll: float,
 
     matchup = ml["matchup"]
     commence_time = ml.get("commence_time")
-    equipos = [k for k in ml if k not in ("matchup", "commence_time")]
+    equipos = [k for k in ml if k not in ("matchup", "commence_time", "n_books")]
     if len(equipos) != 2:
         return {"error": "Mercado incompleto"}
 
