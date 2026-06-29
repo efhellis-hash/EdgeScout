@@ -660,7 +660,10 @@ def _job_cierre():
 
 
 sched = BackgroundScheduler(timezone="UTC")
-sched.add_job(_job, "cron", hour=RUN_HOUR, minute=0)
+# Analisis automatico cada hora de 9 AM a 1 PM Florida (13-17 UTC). Captura las
+# lineas conforme maduran en la manana; la corrida de la 1 PM deja los datos mas
+# frescos antes de los juegos de la tarde.
+sched.add_job(_job, "cron", hour="13-17", minute=0)
 sched.add_job(_job_cierre, "interval", minutes=5)
 sched.start()
 
