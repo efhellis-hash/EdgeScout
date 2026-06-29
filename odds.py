@@ -137,8 +137,9 @@ def best_moneyline(game: dict):
       - fair_prob : prob justa de CONSENSO (devig por casa). ESTE es el arreglo:
         antes salia de cruzar mejores precios de casas distintas, lo cual deforma
         la probabilidad. Ahora es honesta.
-    Tambien expone fair_source y n_books para que el resto del sistema pueda
-    desconfiar de un consenso de pocas casas."""
+    Mantiene EXACTAMENTE el mismo contrato que la version original (solo llaves de
+    equipos + matchup + commence_time), porque los callers identifican a los
+    equipos como 'todo lo que no sea matchup/commence_time'."""
     # --- mejor precio por equipo (no cambia) ---
     teams = {}
     for book in game.get("bookmakers", []):
@@ -168,6 +169,4 @@ def best_moneyline(game: dict):
 
     res["matchup"] = f"{game.get('away_team')} @ {game.get('home_team')}"
     res["commence_time"] = game.get("commence_time")
-    res["fair_source"] = cons["fuente"]
-    res["n_books"] = cons["n"]
     return res
