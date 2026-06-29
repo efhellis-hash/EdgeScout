@@ -6,9 +6,13 @@ cierre. Si tu CLV es positivo de forma sostenida sobre una muestra grande,
 tienes algo real. Si no, tu win rate es ilusion. Esto es lo PRIMERO que mides.
 
 CAMBIO 2026-06: se anade la columna `commence_time` (hora de inicio del juego).
-Es la clave que faltaba para distinguir juegos distintos de la MISMA serie
-(ej. Mariners@Tigers viernes vs sabado). Sin ella, el analisis de un juego se
-embarraba sobre todos los juegos de los mismos equipos.
+Es la clave que faltaba para distinguir juegos distintos de la MISMA serie.
+
+CAMBIO 2026-06 (CLV encendido): se anade `picks_por_cerrar()`, que devuelve los
+picks sin cierre cuya hora de inicio esta a punto de llegar. Es lo que faltaba
+para que el CLV dejara de estar apagado: closing.py la usa para capturar la
+linea de cierre y llamar a cerrar_pick(). Sin esto, clv_pct quedaba NULL para
+siempre y resumen_clv() siempre devolvia n=0 (un CLV decorativo).
 """
 import os
 import json
@@ -18,7 +22,6 @@ from config import DB_PATH
 
 
 def init_db():
-    # Asegura que exista la carpeta de la base (ej. /data del volumen)
     carpeta = os.path.dirname(DB_PATH)
     if carpeta:
         os.makedirs(carpeta, exist_ok=True)
@@ -40,7 +43,6 @@ def init_db():
             is_pick INTEGER         -- 1 si paso el filtro de valor, 0 si no
         )
     """)
-    # Migracion para bases ya creadas sin las columnas nuevas
     migraciones = {"commence_time": "TEXT", "factors": "TEXT", "weather": "TEXT",
                    "reason": "TEXT", "data_quality": "TEXT", "market_fair": "REAL",
                    "is_pick": "INTEGER"}
@@ -48,7 +50,7 @@ def init_db():
         try:
             con.execute(f"ALTER TABLE picks ADD COLUMN {col} {tipo}")
         except sqlite3.OperationalError:
-            pass  # ya existe
+            pass
     con.commit()
     con.close()
 
@@ -57,13 +59,7 @@ def log_analysis(sport, matchup, team, decimal_at_pick, model_prob, market_fair,
                  ev, stake_pct, is_pick, factors=None, weather=None,
                  reason=None, data_quality=None, commence_time=None):
     """Guarda el analisis de UN equipo (haya pasado o no el filtro).
-    is_pick=1 marca los que son recomendaciones reales.
-
-    commence_time: hora de inicio del juego en ISO (de la API de odds). Es lo que
-    permite separar juegos distintos de la misma serie. Si llega None, el sistema
-    cae en el comportamiento viejo (agrupar solo por matchup) para no romper datos
-    historicos, pero DEBES pasarlo desde el analyst para que el anti-duplicado
-    funcione."""
+    is_pick=1 marca los que son recomendaciones reales."""
     con = sqlite3.connect(DB_PATH)
     cur = con.execute(
         "INSERT INTO picks (ts, sport, matchup, team, commence_time, "
@@ -83,12 +79,7 @@ def log_analysis(sport, matchup, team, decimal_at_pick, model_prob, market_fair,
 
 
 def analisis_recientes():
-    """Devuelve el analisis mas reciente por (matchup, commence_time, equipo).
-
-    Antes agrupaba solo por (matchup, team), lo que colapsaba todos los juegos de
-    una serie en uno. Ahora cada juego (identificado por su hora de inicio) tiene
-    su propio analisis. Las filas viejas con commence_time NULL siguen agrupandose
-    como antes (SQLite trata los NULL como un solo grupo)."""
+    """Analisis mas reciente por (matchup, commence_time, equipo)."""
     con = sqlite3.connect(DB_PATH)
     try:
         rows = con.execute(
@@ -115,6 +106,50 @@ def analisis_recientes():
             "reason": r[14], "data_quality": r[15],
         })
     return out
+
+
+# ---- Cierre de CLV --------------------------------------------------------
+def _parse_utc(iso):
+    """ISO -> datetime aware en UTC. None si no parsea."""
+    if not iso:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=dt.timezone.utc)
+        return t.astimezone(dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def picks_por_cerrar(ventana_min_antes: int = 20, ventana_min_despues: int = 0):
+    """Picks reales (is_pick=1) aun sin cierre cuyo primer pitch esta cerca.
+
+    Capturamos la linea de cierre en los minutos PREVIOS al inicio (la API de
+    odds suele soltar la linea pre-juego apenas arranca). Por eso la ventana es
+    sobre todo 'antes': por defecto desde 20 min antes hasta el inicio.
+
+    Devuelve dicts con id, sport, matchup, team, commence_time, decimal_at_pick.
+    Es una consulta barata (solo BD): closing.py solo gasta API si esto trae algo."""
+    ahora = dt.datetime.now(dt.timezone.utc)
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT id, sport, matchup, team, commence_time, decimal_at_pick "
+        "FROM picks WHERE is_pick=1 AND clv_pct IS NULL AND closing_decimal IS NULL "
+        "AND commence_time IS NOT NULL"
+    ).fetchall()
+    con.close()
+
+    pend = []
+    for r in rows:
+        ct = _parse_utc(r["commence_time"])
+        if not ct:
+            continue
+        delta_min = (ct - ahora).total_seconds() / 60.0
+        if -ventana_min_despues <= delta_min <= ventana_min_antes:
+            pend.append(dict(r))
+    return pend
 
 
 def cerrar_pick(pick_id: int, closing_decimal: float, result: str = None):
