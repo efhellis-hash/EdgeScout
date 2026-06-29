@@ -141,7 +141,7 @@ def juegos_con_odds():
         ml = best_moneyline(g)
         if not ml:
             continue
-        equipos = [k for k in ml if k not in ("matchup", "commence_time")]
+        equipos = [k for k in ml if k not in ("matchup", "commence_time", "n_books")]
         lista = [{"team": t, "american": ml[t]["american"],
                   "fair": ml[t]["fair_prob"], "book": ml[t]["book"],
                   "logo": _logo(t)}
